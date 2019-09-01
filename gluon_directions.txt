@@ -1,0 +1,417 @@
+PiCluster - Phase 1
+
+Components
+
+1x  TRENDnet's 24-Port 10/100Mbps Switch with 2 Gigabit Ports, model TEG-30262 https://www.trendnet.com/products/product-detail?prod=250_TEG-30262
+1x  USB Charging Station, 60 Ports USB Power Station, Multi Port USB Wall Charger Adapter, Noninterference Multiport Desktop USB Rapid Charger
+8x  Raspberry Pi 3B+
+8x  USB-A to micro USB-B right angle
+8x  UTP cable
+3x  Ethernet cable
+2x  23'' touch monitor HP EliteDisplay E230t
+2x  ThinkCentre M715q Tiny https://www.lenovo.com/gb/en/desktops-and-all-in-ones/thinkcentre/m-series-tiny/ThinkCentre-M715q-Tiny/p/11TC1MT715Q
+2x  US keyboard
+2x  Mouse
+
+Architecture
+
+Client: 1x ThinkCentre with Windows 10 (preinstalled) and 2x Touch Monitor (as single display). 
+Finish installation, create user (gluon-client)
+
+Server: 1x ThinkCentre with Ubuntu Linux. 
+Dual boot (keeping preinstalled Windows 10), and Ubuntu:
+http://releases.ubuntu.com/18.04/ubuntu-18.04.2-desktop-amd64.iso
+Create user: gluon-server
+$ sudo vi /etc/hostname
+	change hostname to gluonserver
+$ sudo vi /etc/hosts 
+change hostname to gluonserver
+
+            Install SSH:
+
+$ sudo apt-get install openssh-server
+$ sudo systemctl enable ssh
+$ sudo systemctl start ssh
+
+$ sudo apt-get install net-tools
+
+
+
+Cluster: 8x Raspberry Pi
+
+
+
+Network booting
+
+We have followed this tutorial: https://blockdev.io/network-booting-a-raspberry-pi-3/
+
+Prepare Raspberry Pi Image
+
+Download Pi Raspbian Buster Lite:
+https://downloads.raspberrypi.org/raspbian_lite_latest
+
+Download Etcher balenaEtcher-1.5.52.dmg
+https://github.com/balena-io/etcher/releases/download/v1.5.52/balenaEtcher-1.5.52.dmg
+
+Flash SD Card (8 GB, class 10)
+
+In a separated Raspberry Pi, boot with HDMI, Ethernet
+Login
+Username: pi
+Password: raspberry
+
+>ping raspberrypi.local
+>scp configure.sh pi@<IP_ADDRESS>:
+
+Run
+> sudo raspi-config
+Configure: 
+Change password (pi)
+Enable SSH: Interfaces, SSH
+Set timezone
+Shutdown >sudo reboot
+
+Get IP Address
+>ping raspberrypi.local
+
+
+Remove HDMI, power on, and from SSH:
+
+Update:
+$ sudo apt-get update
+$ sudo apt-get upgrade
+$ sudo apt-get dist-upgrade
+
+Disable swap:
+$ sudo dphys-swapfile swapoff
+$ sudo dphys-swapfile uninstall
+$ sudo update-rc.d dphys-swapfile remove
+
+Update firmware
+$ sudo apt-get install rpi-update
+$ sudo rpi-update
+
+Disable BT, Wifi, HDMI:
+$ sudo nano /etc/rc.local
+/usr/bin/tvservice -o
+
+$ sudo systemctl disable bluetooth
+$ sudo service bluetooth stop
+$ sudo systemctl disable hciuart
+$ sudo service  hciuart stop
+
+$ sudo reboot
+
+SDCard clone - ROOTFS
+
+$ sudo mkdir -p /nfs/client1
+$ sudo apt-get install -y rsync
+$ sudo rsync -xa --progress --exclude /nfs / /nfs/client1
+
+$ cd /nfs/client1
+$ sudo mount --bind /dev dev
+$ sudo mount --bind /sys sys
+$ sudo mount --bind /proc proc
+$ sudo chroot .
+rm /etc/ssh/ssh_host_*
+dpkg-reconfigure openssh-server
+exit
+$ sudo umount dev
+$ sudo umount sys
+$ sudo umount proc
+
+$ sudo rm /nfs/client1/var/swap
+
+Tar and copy to Ubuntu server:
+$ sudo tar -cpf /nfs.tar /nfs
+$ scp /nfs.tar gluon-server@gluonserver.local:/home/gluon-server/Downloads/raspbian32
+
+SDCard Clone - BOOT
+Prepare config:
+$ echo program_usb_boot_mode=1 | sudo tee -a /boot/config.txt
+$ echo dtoverlay=pi3-disable-wifi | sudo tee -a /boot/config.txt
+$ echo dtoverlay=pi3-disable-bt | sudo tee -a /boot/config.txt
+
+Tar and copy to Ubuntu server:
+sudo tar -cpf /boot.tar /boot
+scp /boot.tar gluon-server@gluonserver.local:/home/gluon-server/Downloads/raspbian32
+sudo reboot
+
+Login, test:
+$ vcgencmd otp_dump | grep 17:
+>17:3020000a
+$ sudo shutdown -h now
+remove card
+
+Prepare Ubuntu Server
+
+Check local IP: 192.168.68.107
+
+1. DHCP
+$ sudo apt-get install isc-dhcp-server
+$ sudo nano /etc/dhcp/dhcpd.conf
+
+default-lease-time 86400;
+max-lease-time 86400;
+
+authoritative;
+
+log-facility local7;
+
+subnet 192.168.68.0 netmask 255.255.255.0 {
+  range 192.168.68.150 192.168.68.200;
+
+  option domain-name-servers 192.168.68.107, 8.8.8.8, 8.8.4.4;
+  option routers 192.168.68.1;
+
+  next-server 192.168.68.107;
+  option tftp-server-name "192.168.68.107";
+}
+
+$ sudo service isc-dhcp-server restart
+
+2. TFTP
+$ sudo apt-get install -y tftpd
+$ sudo nano /etc/xinetd.d/tftp
+service tftp
+{
+protocol        = udp
+port            = 69
+socket_type     = dgram
+wait            = yes
+user            = nobody
+server          = /usr/sbin/in.tftpd
+server_args     = /tftpboot
+disable         = no
+}
+
+Copy boot
+$ cd /home/gluon-server/Downloads/raspbian32
+$ sudo tar --same-owner -xvf boot.tar 
+$ sudo mkdir /tftpboot
+$ sudo mv boot/* /tftpboot
+
+Start service
+$ sudo service xinetd restart
+
+3. NFS
+$ sudo apt-get install -y nfs-kernel-server
+$ cd /home/gluon-server/Downloads/raspbian32
+$ sudo tar --same-owner -xvf nfs.tar 
+$ sudo mv nfs/client1/ /nfs
+
+$echo "/nfs/client1 *(rw,sync,no_subtree_check,no_root_squash)" | sudo tee -a /etc/exports
+$ sudo systemctl enable rpcbind
+$ sudo systemctl restart rpcbind
+$ sudo systemctl enable nfs-kernel-server
+$ sudo systemctl restart nfs-kernel-server
+
+$ sudo nano /tftpboot/cmdline.txt 
+(Remove content and add:)
+selinux=0 dwc_otg.lpm_enable=0 console=tty1 rootwait rw nfsroot=192.168.68.107:/nfs/client1,v3 ip=dhcp root=/dev/nfs elevator=deadline modprobe.blacklist=bcm2835_v4l2
+
+$ cd /nfs/client1/etc
+$ sudo nano localhost
+localhost
+
+$ cd /nfs/client1/etc/dhcp/dhclient-enter-hooks.d/
+$ sudo nano unset_old_hostname
+unset old_host_name
+
+$ sudo nano /nfs/client1/etc/fstab
+(remove all entries after first line)
+
+Boot Raspberry Pi
+
+One by one, plug one Raspberry Pi, and from the Ubuntu server run:
+$ sudo tail -f /var/log/syslog
+
+The MAC address of the Raspberry Pi, and the assigned IP will show up, like:
+
+> Aug 17 13:07:30 gluonserver dhcpd[1454]: DHCPDISCOVER from b8:27:eb:a3:fc:c4 via enp1s0f0
+> Aug 17 13:07:30 gluonserver dhcpd[1454]: DHCPOFFER on 192.168.68.119 to b8:27:eb:a3:fc:c4 via enp1s0f0
+
+The TFTP server will serve all the required files from the boot folder:
+
+> Aug 17 13:07:29 gluonserver tftpd[20991]: tftpd: trying to get file: bootcode.bin
+> Aug 17 13:07:29 gluonserver tftpd[20991]: tftpd: serving file from /tftpboot
+...
+
+It takes almost 2 minutes to fully boot:
+
+> Aug 17 13:09:13 gluonserver dhcpd[1454]: DHCPACK on 192.168.68.119 to b8:27:eb:a3:fc:c4 via enp1s0f0
+> Aug 17 13:09:13 gluonserver rpc.mountd[934]: authenticated mount request from 192.168.68.119:848 for /nfs/client1 (/nfs/client1)
+
+Once this message shows up, the Pi should be accessible via ssh:
+$ ssh pi@192.168.68.119
+(response)
+Otherwise, something went wrong.
+
+MAC/IP Addresses
+Once every Pi is started, it is convenient to give them a name, and get their MAC address and IP address.
+
+$ cd /nfs/client1/etc
+$ sudo nano hosts
+192.168.68.113  pi3-1
+192.168.68.115  pi3-2
+192.168.68.117  pi3-3
+192.168.68.118  pi3-4
+192.168.68.119  pi3-5
+192.168.68.121  pi3-6
+192.168.68.122  pi3-7
+192.168.68.124  pi3-8
+
+$ sudo nano /etc/dhcp/dhcpd.conf
+…
+ option tftp-server-name "192.168.68.107";
+  host Pi3-1 {
+    hardware ethernet b8:27:eb:41:48:a2;
+    fixed-address 192.168.68.113;
+    option host-name "Pi3-1";
+  }
+  host Pi3-2 {
+    hardware ethernet b8:27:eb:5d:f4:d2;
+    fixed-address 192.168.68.115;
+    option host-name "Pi3-2";
+  }
+  host Pi3-3 {
+    hardware ethernet b8:27:eb:02:f3:3a;
+    fixed-address 192.168.68.117;
+    option host-name "Pi3-3";
+  }
+  host Pi3-4 {
+    hardware ethernet b8:27:eb:9a:65:09;
+    fixed-address 192.168.68.118;
+    option host-name "Pi3-4";
+  }
+  host Pi3-5 {
+    hardware ethernet b8:27:eb:a3:fc:c4;
+    fixed-address 192.168.68.119;
+    option host-name "Pi3-5";
+  }
+  host Pi3-6 {
+    hardware ethernet b8:27:eb:07:f6:13;
+    fixed-address 192.168.68.121;
+    option host-name "Pi3-6";
+  }
+  host Pi3-7 {
+    hardware ethernet b8:27:eb:4a:d7:71;
+    fixed-address 192.168.68.122;
+    option host-name "Pi3-7";
+  }
+  host Pi3-8 {
+    hardware ethernet b8:27:eb:12:f8:d5;
+    fixed-address 192.168.68.124;
+    option host-name "Pi3-8";
+  }
+}
+
+Enable SSH
+UBUNTU
+cd ~
+ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa
+
+PI
+cd ~
+ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa
+scp gluon-server@gluonserver.local:/home/gluon-server/.ssh/id_rsa.pub id_rsaServer.pub
+cat id_rsaServer.pub >> authorized_keys
+rm id_rsaServer.pub
+
+UBUNTU
+
+scp pi@192.168.68.113:/home/pi/.ssh/id_rsa.pub id_rsaPi.pub
+cat id_rsaPi.pub >> authorized_keys
+rm id_rsaPi.pub
+
+- Connect to each PI, so public key is added to known_hosts
+
+
+NOTES
+
+Each Pi takes around 2 minutes to fully boot. Not always the process work.
+The firmware has a list of “required” files, but not all these files are present. However, for each file, TFTP has a timeout of around 5 seconds if the file is not found, while it serves it if found at a speed of about 2 MBits/s (with the current setup).
+
+Only two Pis can be booted at the same time, and this does not always work.
+There is this issue: https://github.com/raspberrypi/firmware/issues/1120 that mentions something similar.
+
+The Pis require a full power cycle, they can’t be rebooted.
+Sudo reboot will work, however, the Pi won’t netboot anymore. The only way to get it booting again from nfs is by botting it again with an SDCard.
+https://github.com/raspberrypi/firmware/issues/963
+
+Shared install: All the devices have read-write access to the NFS file system in the configuration above, so any packages or changes installed on one are available to all.
+
+
+
+Pi Cluster Software
+Install Java in the Windows 10 client
+Download JDK 12 and unzip:
+https://download.java.net/java/GA/jdk12.0.2/e482c34c86bd4bf8b56c0b35558996b9/10/GPL/openjdk-12.0.2_windows-x64_bin.zip
+
+
+Install Java in the Ubuntu Server
+
+$ mkdir Downloads
+$ cd Downloads
+$ wget https://github.com/AdoptOpenJDK/openjdk11-binaries/releases/download/jdk-11.0.4%2B11/OpenJDK11U-jdk_x64_linux_hotspot_11.0.4_11/ -O OpenJDK11U-jdk_x64_linux_hotspot_11.0.4_11.tar.gz
+$ sudo tar -xvzf OpenJDK11U-jdk_x64_linux_hotspot_11.0.4_11.tar.gz -C /opt
+$ sudo rm OpenJDK11U-jdk_x64_linux_hotspot_11.0.4_11.tar.gz
+
+$ sudo update-alternatives --install "/usr/bin/java" "java" "/opt/jdk-11.0.4+11/bin/java" 1
+$ sudo update-alternatives --set java /opt/jdk-11.0.4+11/bin/java
+$ sudo update-alternatives --install "/usr/bin/javac" "javac" "/opt/jdk-11.0.4+11/bin/javac" 1
+$  sudo update-alternatives --set javac /opt/jdk-11.0.4+11/bin/javac
+
+$nano /home/gluon-server/.bashrc
+export JAVA_HOME=/opt/jdk-11.0.4+11
+export PATH=$PATH:$JAVA_HOME/bin
+
+PI
+$ cd Downloads
+$ wget https://github.com/AdoptOpenJDK/openjdk11-binaries/releases/download/jdk-11.0.4%2B11/OpenJDK11U-jdk_arm_linux_hotspot_11.0.4_11.tar.gz/ -O OpenJDK11U-jdk_arm_linux_hotspot_11.0.4_11.tar.gz
+$ sudo tar -xvzf OpenJDK11U-jdk_arm_linux_hotspot_11.0.4_11.tar.gz -C /opt
+$ sudo rm OpenJDK11U-jdk_arm_linux_hotspot_11.0.4_11.tar.gz 
+$ cd /opt
+
+$ sudo update-alternatives --install "/usr/bin/java" "java" "/opt/jdk-11.0.4+11/bin/java" 1
+$ sudo update-alternatives --set java /opt/jdk-11.0.4+11/bin/java
+$ sudo update-alternatives --install "/usr/bin/javac" "javac" "/opt/jdk-11.0.4+11/bin/javac" 1
+$  sudo update-alternatives --set javac /opt/jdk-11.0.4+11/bin/javac
+
+$nano /home/gluon-server/.bashrc
+export JAVA_HOME=/opt/jdk-11.0.4+11
+export PATH=$PATH:$JAVA_HOME/bin
+
+IOTMonitor
+
+Run IoTMonitoringServer from Ubuntu Server (if connected to a monitor)  or from Windows 10 client See image-iotserver-lin.zip or image-iotserver-win.zip: download and unzip, and run the script under image/bin/iotserver
+
+Run IoTMonitoringClient in all the Pis. Set IP to 192.168.68.107 (Ubuntu) or 192.168.68.161 (Windows 10). Copy MainMonitor.java to one Pi (in home/pi/Downloads for instance)
+$ cd Downloads
+$ java -XX:-UsePerfData /home/pi/Downloads/MainMonitor.java 192.168.68.161
+
+The iot server will receive updates from this Pi (or any other running the same):
+
+
+
+
+DisplayApp
+
+Run DisplayApp from Windows 10 client See image-display-win.zip: download and unzip, and run the script under image/bin/display
+Run server.jar from the Ubuntu server: 
+$ cd Downloads
+$ java -jar server.jar
+Run MainWorker.java from Pis:
+$ java -XX:-UsePerfData MainWorker.java 192.168.68.107 192.168.68.161
+Run ClientApp.java from any computer in the network:
+$ java ClientApp.java 192.168.68.107
+
+
+
+
+
+
+
+
+
+
